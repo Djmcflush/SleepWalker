@@ -3,6 +3,9 @@ Dream booth implementation for Text To Motion models to fine tune to YOUR motion
 
 
 ## Acknowledgements
+The inspiration for this work is the Text to Motion diffusion model from Eric Guo as well as my previous expierence at X:
+https://github.com/EricGuo5513/text-to-motion/tree/main
+
 
 This work wouldnt be possible without the help of the following:
 
@@ -22,3 +25,4 @@ https://keras.io/examples/generative/dreambooth/
 
 As well as Xavier Zhao's implementation of DreamBooth:
 https://github.com/XavierXiao/Dreambooth-Stable-Diffusion/tree/main
+

@@ -1,0 +1,9 @@
+Python = 3.7.9   # Other version may also work but are not tested.
+PyTorch = 1.6.0 (conda install pytorch==1.6.0 torchvision==0.7.0 -c pytorch)  #Other version may also work but are not tested.
+scipy
+numpy
+tensorflow       # For use of tensorboard only
+spacy
+tqdm
+ffmpeg = 4.3.1   # Other version may also work but are not tested.
+matplotlib = 3.3.1
