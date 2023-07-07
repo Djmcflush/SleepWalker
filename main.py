@@ -2,7 +2,7 @@
 """Two things to finetune """
 ### 1. The noise generator
 ### 2. The text encoder
-
+### 3. Diffusion model
 
 import tensorflow as tf
 import tensorflow.experimental.numpy as tnp
