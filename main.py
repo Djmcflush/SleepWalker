@@ -16,40 +16,20 @@ MAX_PROMPT_LENGTH = 77
 DIM_WORD = 300
 DIM_POS_OHOT = len(POS_enumerator)
 
+dim_pose = 263
+num_classes = 200 // opt.unit_length
+meta_root = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
 
-if opt.dataset_name == 't2m':
-        opt.data_root = './dataset/HumanML3D'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 22
-        opt.max_motion_length = 196
-        dim_pose = 263
-        num_classes = 200 // opt.unit_length
-        meta_root = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
-elif opt.dataset_name == 'kit':
-    opt.data_root = './dataset/KIT-ML'
-    opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-    opt.text_dir = pjoin(opt.data_root, 'texts')
-    opt.joints_num = 21
-    radius = 240 * 8
-    fps = 12.5
-    dim_pose = 251
-    opt.max_motion_length = 196
-    num_classes = 200 // opt.unit_length
-    meta_root = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD005', 'meta')
-
-else:
-    pass
 
 class SleepWalkerTrainer(tf.keras.Model):
     # Reference:
     # https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/train_dreambooth.py
+    #the text to motion generation model is: ./checkpoints/t2m/Comp_v6_KLD01/           # Text-to-motion generation model
 
     def __init__(
         self,
-        motion_encoder, #our motion encoder model
         movement_encoder,# our movement enocder
-        diffusion_model,#
+        diffusion_model,#CompTrainerV6
         noise_scheduler,
         opt,
         use_mixed_precision=False,
@@ -58,9 +38,15 @@ class SleepWalkerTrainer(tf.keras.Model):
         **kwargs
     ):
         super().__init__(**kwargs)
+        # if opt.dataset_name == 't2m':
+        opt.data_root = './dataset/HumanML3D'
+        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
+        opt.text_dir = pjoin(opt.data_root, 'texts')
+        opt.joints_num = 22
+        opt.max_motion_length = 196
+
 
         self.movement_encoder = movement_encoder
-        self.motion_encoder = motion_encoder
         self.diffusion_model = diffusion_model
         self.noise_scheduler = noise_scheduler
         #Only finetune text_encoder if user wishes to do so
@@ -79,134 +65,157 @@ class SleepWalkerTrainer(tf.keras.Model):
         self.max_grad_norm = max_grad_norm
         self.use_mixed_precision = use_mixed_precision
 
+    
+    def generate_inversion(self, word_hids, hidden, motions, m_lens):
+
+        # print(motions.shape)
+        # (batch_size, motion_len, pose_dim)
+
+        '''Movement Encoding'''
+        # Initially input a mean vector
+        movements_latents  = self.movement_enc(motions[..., :-4])
+        mov_len = movements_latents.shape[1]
+        mov_in = self.sample_from_encoder_outputs(movements_latents)
+        latents = latents * 0.18215
+        target = tf.random.normal(tf.shape(latents))
+
+        hidden_pri = self.seq_pri.get_init_hidden(hidden)
+        hidden_dec = self.seq_dec.get_init_hidden(hidden)
+
+        mus_pri = []
+        logvars_pri = []
+        fake_mov_batch = []
+        att_wgt = []
+        mus_post = []
+        logvars_post = []
+
+        query_input = []
+        for i in range(mov_len):
+
+            mov_tgt = self.movements[:, i]
+
+            '''Local Attention Vector'''
+            att_vec, co_weights = self.diffusion_model.att_layer(hidden_dec[-1], word_hids)
+            query_input.append(hidden_dec[-1])
+
+            tta = m_lens // self.opt.unit_length - i
+            # tta = m_lens - i
+
+
+            if self.opt.text_enc_mod == 'bigru':
+                pos_in = torch.cat([mov_in, mov_tgt, att_vec], dim=-1)
+                pri_in = torch.cat([mov_in, att_vec], dim=-1)
+
+            elif self.opt.text_enc_mod == 'transformer':
+                pos_in = torch.cat([mov_in, mov_tgt, att_vec.detach()], dim=-1)
+                pri_in = torch.cat([mov_in, att_vec.detach()], dim=-1)
+
+            '''Posterior'''
+            z_pos, mu_pos, logvar_pos, hidden_pos = self.diffusion_model.seq_post(pos_in, hidden_pos, tta)
+
+            '''Prior'''
+            z_pri, mu_pri, logvar_pri, hidden_pri = self.diffusion_model.seq_pri(pri_in, hidden_pri, tta)
+
+            '''Decoder'''
+            dec_in = torch.cat([mov_in, att_vec, z_pos], dim=-1) #Train mode
+            # dec_in = torch.cat([mov_in, att_vec, z_pri], dim=-1) #Eval Mode
+            fake_mov, hidden_dec = self.diffusion_model.seq_dec(dec_in, mov_in, hidden_dec, tta)
+
+            # print(fake_mov.shape)
+
+            mus_post.append(mu_pos)
+            logvars_post.append(logvar_pos)
+            mus_pri.append(mu_pri)
+            logvars_pri.append(logvar_pri)
+            fake_mov_batch.append(fake_mov.unsqueeze(1))
+            att_wgt.append(co_weights)
+
+            mov_in = fake_mov.detach()
+
+        self.diffusion_model.fake_movements = torch.cat(fake_mov_batch, dim=1)
+        self.diffusion_model.att_wgts = torch.cat(att_wgt, dim=-1)
+
+        # print(self.fake_movements.shape)
+
+        self.diffusion_model.fake_motions = self.diffusion_model.mov_dec(self.diffusion_model.fake_movements)
+
+        self.diffusion_model.mus_pri = torch.cat(mus_pri, dim=0)
+        self.diffusion_model.logvars_pri = torch.cat(logvars_pri, dim=0)
+        self.diffusion_model.mus_post = torch.cat(mus_post, dim=0)
+        self.diffusion_model.mus_pri = torch.cat(mus_pri, dim=0)
+        self.diffusion_model.logvars_post = torch.cat(logvars_post, dim=0)
+        self.diffusion_model.logvars_pri = torch.cat(logvars_pri, dim=0)
+
+        return self.diffusion_model.fake_motions, self.diffusion_model.fake_movements, target    
+
+
+    def sample_from_encoder_outputs(self, outputs):
+        # Flatten the tensor except for the last dimension
+        last_dim = tf.shape(outputs)[-1]
+        flattened_shape = tf.concat([[-1], [last_dim]], axis=0)
+        reshaped_outputs = tf.reshape(outputs, flattened_shape)
+
+        # Split the flattened tensor into mean and logvar
+        mean, logvar = tf.split(reshaped_outputs, 2, axis=-1)
+
+        # Clip the logvar values to a specific range
+        logvar = tf.clip_by_value(logvar, -30.0, 20.0)
+
+        # Calculate the standard deviation from logvar
+        std = tf.exp(0.5 * logvar)
+
+        # Generate a random sample with the same shape as the mean tensor
+        sample = tf.random.normal(tf.shape(mean), dtype=mean.dtype)
+
+        # Reshape the sample back to the original N-dimensional shape
+        original_shape = tf.shape(outputs)
+        reshaped_sample = tf.reshape(sample, original_shape)
+
+        # Calculate the final sampled output by combining mean and standard deviation
+        return mean + std * reshaped_sample
+
     def train_step(self, inputs):  # sourcery skip: extract-method
-        # instance_batch = inputs[0]
-        # class_batch = inputs[1]
-        # instance_images = instance_batch["instance_images"]
-        # instance_texts = instance_batch["instance_texts"]
-        # class_images = class_batch["class_images"]
-        # class_texts = class_batch["class_texts"]
-        instance_word_emb,  instance_motions = inputs[0] #batch_data
-        class_word_emb, class_pos_ohot, class_caption, class_cap_lens, class_motions, class_m_lens, _ = inputs[1] #batch_data
-        #word_emb, #pos_ohot, #caption, #cap_lens, #motions, #m_lens, _ = batch_data
+        '''Define TrainStep for Sleepwalker. Here variables with the term instance mean motions introduced by the user. 
+        Variables with the term class as a prefix are generated by the diffusion model for class priors'''
+        #Algorithim
+        # Encode motions
+        # sample latent from motion latents
+        # create noise from motion output latents
+        # decode text encodings to motioons
+        # compute loss between 
+
+        instance_batch = inputs[0]
+        class_batch = inputs[1]
+
+        instance_word_emb, instance_pos_ohot, instance_caption, instance_cap_lens, instance_motions, instance_m_lens = instance_batch #3-10
+        class_word_emb, class_pos_ohot, class_caption, class_cap_lens, class_motions, class_m_lens = class_batch #200-300
         
 
         motions = tf.concat([instance_motions, class_motions], 0)
         texts = tf.concat(
             [instance_word_emb, class_word_emb], 0
         )  # `texts` can either be caption tokens or embedded caption tokens.
-        batch_size = tf.shape(motions)[0]
+        pos_ohot = tf.concat([instance_pos_ohot, class_pos_ohot], 0)
+        # captions = tf.concat([instance_caption, class_caption], 0)
+        cap_lens = tf.concat([instance_cap_lens, class_m_lens],0)
+        m_lens = instance_m_lens + class_m_lens
+        # batch_size = tf.shape(motions)[0]
+        word_hids, hidden = self.text_enc(texts, pos_ohot, cap_lens)
 
         with tf.GradientTape() as tape:
-            # If the `text_encoder` is being fine-tuned.
-            if self.train_text_encoder:
-                texts = self.text_encoder(texts, self.pos_ohot, self.cap_lens)
-
-            # Project image into the latent space and sample from it.
-            movements_latents  = self.movement_enc(motions[..., :-4])
-            motion_latents = self.motion_encoder(movements_latents, self.m_lens)
-
-            latents = self.sample_from_encoder_outputs(motion_latents)
-            # Know more about the magic number here:
-            # https://keras.io/examples/generative/fine_tune_via_textual_inversion/
-            latents = latents * 0.18215
-
-            # Sample noise that we'll add to the latents.
-            noise = tf.random.normal(tf.shape(latents))
-
-            # Sample a random timestep for each image.
-            timesteps = tnp.random.randint(
-                0, self.noise_scheduler.train_timesteps, (batch_size,)
-            )
-
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process).
-            noisy_latents = self.noise_scheduler.add_noise(
-                tf.cast(latents, noise.dtype), noise, timesteps
-            )
-            # Get the target for loss depending on the prediction type
-            # just the sampled noise for now.
-            target = noise  # noise_schedule.predict_epsilon == True
-
-            # Predict the noise residual and compute loss.
-            timestep_embedding = tf.map_fn(
-                lambda t: self.get_timestep_embedding(t), timesteps, dtype=tf.float32
-            )
             
-            model_pred = self.diffusion_model.generate(
-                [noisy_latents, timestep_embedding, texts], training=True
-            )
-            loss = self.compute_loss(target, model_pred)
-            if self.use_mixed_precision:
-                loss = self.optimizer.get_scaled_loss(loss)
+            fake_motions, fake_movements, target_movements  =  self.generate_inversion(word_hids, hidden, motions, m_lens)
+            log_dict = self.diffusion_model.update() # does loss of mov and loss of motions Then updates gradients
 
-        # Update parameters of the diffusion model.
-        if self.train_text_encoder:
-            trainable_vars = (
-                self.text_encoder.trainable_variables
-                + self.diffusion_model.trainable_variables
-            )
-        else:
-            trainable_vars = self.diffusion_model.trainable_variables
-
-        gradients = tape.gradient(loss, trainable_vars)
-        if self.use_mixed_precision:
-            gradients = self.optimizer.get_unscaled_gradients(gradients)
-        gradients = [tf.clip_by_norm(g, self.max_grad_norm) for g in gradients]
-        self.optimizer.apply_gradients(zip(gradients, trainable_vars))
-
-        return {m.name: m.result() for m in self.metrics}
-
-    def get_timestep_embedding(self, timestep, dim=320, max_period=10000):
-        half = dim // 2
-        log_max_preiod = tf.math.log(tf.cast(max_period, tf.float32))
-        freqs = tf.math.exp(-log_max_preiod * tf.range(0, half, dtype=tf.float32) / half)
-        args = tf.convert_to_tensor([timestep], dtype=tf.float32) * freqs
-        embedding = tf.concat([tf.math.cos(args), tf.math.sin(args)], 0)
-        return embedding
-
-    def sample_from_encoder_outputs(self, outputs):
-        mean, logvar = tf.split(outputs, 2, axis=-1)
-        logvar = tf.clip_by_value(logvar, -30.0, 20.0)
-        std = tf.exp(0.5 * logvar)
-        sample = tf.random.normal(tf.shape(mean), dtype=mean.dtype)
-        return mean + std * sample
-
-    def compute_loss(self, target, model_pred):
-        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-        model_pred, model_pred_prior = tf.split(model_pred, num_or_size_splits=2, axis=0)
-        target, target_prior = tf.split(target, num_or_size_splits=2, axis=0)
-
-        # Compute instance loss.
-        loss = self.compiled_loss(target, model_pred)
-
-        # Compute prior loss.
-        prior_loss = self.compiled_loss(target_prior, model_pred_prior)
-
-        # Add the prior loss to the instance loss.
-        loss = loss + self.prior_loss_weight * prior_loss
-        return loss
+            ## Compute loss between model prediction and target
+            # loss_mov = self.compute_loss(target_movements, fake_movements)
+            # loss_mot = self.compute_loss(motions, fake_motions)
+           
+        return log_dict
 
     def save_weights(
-        self, ckpt_path_prefix, overwrite=True, save_format=None, options=None
+        self, filename, epoch, total_it, sub_ep, sl_len
     ):
-        # Overriding this method will allow us to use the `ModelCheckpoint`
-        # callback directly with this trainer class. In this case, it will
-        # only checkpoint the `diffusion_model` and optionally the `text_encoder`.
-        diffusion_model_path = ckpt_path_prefix + "-unet.h5"
-        self.diffusion_model.save_weights(
-            filepath=diffusion_model_path,
-            overwrite=overwrite,
-            save_format=save_format,
-            options=options,
-        )
-        self.diffusion_model_path = diffusion_model_path
-        if self.train_text_encoder:
-            text_encoder_model_path = ckpt_path_prefix + "-text_encoder.h5"
-            self.text_encoder.save_weights(
-                filepath=text_encoder_model_path,
-                overwrite=overwrite,
-                save_format=save_format,
-                options=options,
-            )
-            self.text_encoder_model_path = text_encoder_model_path
+        ##Save model State
+        self.diffusion_model.save(filename, epoch, total_it, sub_ep, sl_len)
+        
