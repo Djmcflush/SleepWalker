@@ -3,13 +3,17 @@
 ### 1. The noise generator
 ### 2. The text encoder
 ### 3. Diffusion model
-
+from data.dataset import RawTextDataset, Text2MotionDataset
 import tensorflow as tf
 import tensorflow.experimental.numpy as tnp
+from torch.utils.data import DataLoader
 from utils.word_vectorizer import WordVectorizer, POS_enumerator
- 
+from utils.opt import OptModel
+from utils.build import build_models
 # from keras_cv.models.stable_diffusion.text_encoder import TextEncoder
 from models import *
+from os.path import join as pjoin
+
 
 PADDING_TOKEN = 49407
 MAX_PROMPT_LENGTH = 77
@@ -25,11 +29,11 @@ class SleepWalkerTrainer(tf.keras.Model):
     # https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/train_dreambooth.py
     #the text to motion generation model is: ./checkpoints/t2m/Comp_v6_KLD01/           # Text-to-motion generation model
 
+    
     def __init__(
         self,
         movement_encoder,# our movement enocder
         diffusion_model,#CompTrainerV6
-        noise_scheduler,
         opt,
         use_mixed_precision=False,
         prior_loss_weight=1.0,
@@ -38,18 +42,12 @@ class SleepWalkerTrainer(tf.keras.Model):
     ):
         super().__init__(**kwargs)
         # if opt.dataset_name == 't2m':
-        opt.data_root = './dataset/HumanML3D'
-        opt.motion_dir = pjoin(opt.data_root, 'new_joint_vecs')
-        opt.text_dir = pjoin(opt.data_root, 'texts')
-        opt.joints_num = 22
-        opt.max_motion_length = 196
 
-        NUM_CLASSES = 200 // opt.unit_length
-        META_ROOT = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
+        #NUM_CLASSES = 200 // opt.unit_length
+        #META_ROOT = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
 
         self.movement_encoder = movement_encoder
         self.diffusion_model = diffusion_model
-        self.noise_scheduler = noise_scheduler
         #Only finetune text_encoder if user wishes to do so
         if self.train_text_encoder:
             self.text_encoder = TextEncoderBiGRUCo(word_size=DIM_WORD,
@@ -69,7 +67,13 @@ class SleepWalkerTrainer(tf.keras.Model):
     
     def generate_inversion(self, word_hids, hidden, motions, m_lens):
 
-        '''Movement Encoding'''
+        '''
+        Inversion Generation (generate_inversion method): This method generates 
+        the inversion of the model. It takes word hidden states, hidden states, motions,
+        and motion lengths as inputs. It encodes the movements, generates the local attention vector, 
+        computes the posterior and prior, and decodes the movements. It also keeps track of the
+        generated movements and attention weights.
+        '''
         # Initially input a mean vector
         movements_latents  = self.movement_enc(motions[..., :-4])
         mov_len = movements_latents.shape[1]
@@ -148,6 +152,10 @@ class SleepWalkerTrainer(tf.keras.Model):
 
 
     def sample_from_encoder_outputs(self, outputs):
+        """"Sampling from Encoder Outputs (sample_from_encoder_outputs method): 
+        This method takes the outputs of an encoder, splits them into mean and logvar, 
+        generates a random sample, and returns a sampled output by combining the mean and standard deviation."""
+        
         # Flatten the tensor except for the last dimension
         last_dim = tf.shape(outputs)[-1]
         flattened_shape = tf.concat([[-1], [last_dim]], axis=0)
@@ -217,3 +225,26 @@ class SleepWalkerTrainer(tf.keras.Model):
         ##Save model State
         self.diffusion_model.save(filename, epoch, total_it, sub_ep, sl_len)
         
+    
+if __name__ == "__main__":
+    # Initialize the SleepWalkerTrainer
+    opt =OptModel()
+    
+    text_enc, seq_pri, seq_dec, att_layer, mov_enc, mov_dec = build_models(opt)
+    trainer = diffusion(text_enc=text_enc,seq_pri=seq_pri,seq_dec=seq_dec,att_layer=att_layer,mov_enc=mov_enc,mov_dec=mov_dec, args=opt)
+    diffusion_model = trainer.load(pjoin(opt.model_dir, 'latest.tar'))
+    sleep_walker_trainer = SleepWalkerTrainer(movement_encoder=mov_enc,
+                                              diffusion_model=diffusion_model,
+                                              opt=opt
+                                              )
+    w_vectorizer = WordVectorizer('./glove', 'our_vab')
+    dataset_new = Text2MotionDataset(opt, np.load(opt.mean), np.load(opt.st), opt.text_file, w_vectorizer)
+    dataset_old = Text2MotionDataset(opt, np.load(opt.mean), np.load(opt.st), opt.text_file, w_vectorizer)
+    new_motions_dataset = DataLoader(dataset_new, batch_size=1, drop_last=True, num_workers=1)
+    old_motions_dataset = DataLoader(dataset_old, batch_size=1, drop_last=True, num_workers=1)
+    
+    inputs = (new_motions_dataset, old_motions_dataset)
+    # Train the model
+    sleep_walker_trainer.train_step(inputs)
+
+

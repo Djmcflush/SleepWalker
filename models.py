@@ -446,7 +446,7 @@ class diffusion(object):
         self.text_enc = text_enc
         self.seq_pri = seq_pri
         self.att_layer = att_layer
-        self.device = args.device
+        self.device = torch.device("cpu")
         self.seq_dec = seq_dec
         self.mov_dec = mov_dec
         self.mov_enc = mov_enc
