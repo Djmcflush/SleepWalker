@@ -16,10 +16,9 @@ MAX_PROMPT_LENGTH = 77
 DIM_WORD = 300
 DIM_POS_OHOT = len(POS_enumerator)
 
-dim_pose = 263
-num_classes = 200 // opt.unit_length
-meta_root = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
-
+DIM_POSE = 263
+META_ROOT = []
+NUM_CLASSES = 0
 
 class SleepWalkerTrainer(tf.keras.Model):
     # Reference:
@@ -45,6 +44,8 @@ class SleepWalkerTrainer(tf.keras.Model):
         opt.joints_num = 22
         opt.max_motion_length = 196
 
+        NUM_CLASSES = 200 // opt.unit_length
+        META_ROOT = pjoin(opt.checkpoints_dir, opt.dataset_name, 'Comp_v6_KLD01', 'meta')
 
         self.movement_encoder = movement_encoder
         self.diffusion_model = diffusion_model
@@ -67,9 +68,6 @@ class SleepWalkerTrainer(tf.keras.Model):
 
     
     def generate_inversion(self, word_hids, hidden, motions, m_lens):
-
-        # print(motions.shape)
-        # (batch_size, motion_len, pose_dim)
 
         '''Movement Encoding'''
         # Initially input a mean vector
